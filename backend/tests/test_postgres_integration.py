@@ -1,5 +1,5 @@
-import os
 import subprocess
+import sys
 from collections.abc import AsyncGenerator, Generator
 
 import pytest
@@ -9,6 +9,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import selectinload
 
+from forge.db.config import get_settings
 from forge.db.models import (
     Assignment,
     AssignmentStatus,
@@ -20,23 +21,9 @@ from forge.db.models import (
     WorkerStatus,
 )
 
-REQUIRED_DATABASE_VARS = (
-    "POSTGRES_DB",
-    "POSTGRES_USER",
-    "POSTGRES_PASSWORD",
-    "POSTGRES_HOST",
-    "POSTGRES_PORT",
-)
-
 
 def _database_url() -> str:
-    missing = [name for name in REQUIRED_DATABASE_VARS if not os.getenv(name)]
-    if missing:
-        pytest.skip(f"PostgreSQL integration test requires: {', '.join(missing)}")
-    return (
-        f"postgresql+psycopg://{os.environ['POSTGRES_USER']}:{os.environ['POSTGRES_PASSWORD']}"
-        f"@{os.environ['POSTGRES_HOST']}:{os.environ['POSTGRES_PORT']}/{os.environ['POSTGRES_DB']}"
-    )
+    return get_settings().async_database_url
 
 
 @pytest.fixture(scope="module")
@@ -44,7 +31,7 @@ def migrated_database() -> Generator[str, None, None]:
     url = _database_url()
     sync_url = url.replace("+psycopg", "")
     check = subprocess.run(
-        ["alembic", "-x", f"sqlalchemy.url={sync_url}", "current"],
+        [sys.executable, "-m", "alembic", "-x", f"sqlalchemy.url={sync_url}", "current"],
         check=False,
         capture_output=True,
         text=True,
@@ -52,9 +39,9 @@ def migrated_database() -> Generator[str, None, None]:
     if check.returncode != 0:
         pytest.skip("PostgreSQL is not reachable or Alembic is unavailable")
 
-    subprocess.run(["alembic", "upgrade", "head"], check=True)
+    subprocess.run([sys.executable, "-m", "alembic", "upgrade", "head"], check=True)
     yield url
-    subprocess.run(["alembic", "downgrade", "base"], check=True)
+    subprocess.run([sys.executable, "-m", "alembic", "downgrade", "base"], check=True)
 
 
 @pytest_asyncio.fixture

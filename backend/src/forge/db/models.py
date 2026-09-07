@@ -241,7 +241,7 @@ class Reservation(Base):
     released_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
     worker: Mapped[Worker] = relationship(back_populates="reservations")
-    attempt: Mapped[Attempt] = relationship(back_populates="reservation")
+    attempt: Mapped[Attempt] = relationship(back_populates="reservations")
 
     __table_args__ = (
         CheckConstraint("cpu_reserved >= 0", name="ck_reservations_cpu_nonnegative"),
