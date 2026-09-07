@@ -1,5 +1,5 @@
-from forge.db.base import Base
 from forge.db import models  # noqa: F401 - registers all model tables
+from forge.db.base import Base
 
 
 def test_phase_one_tables_are_registered() -> None:

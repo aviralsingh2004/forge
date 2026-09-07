@@ -23,7 +23,7 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 from forge.db.base import Base
 
 
-class StrEnum(str, enum.Enum):
+class StrEnum(enum.StrEnum):
     @classmethod
     def values(cls) -> list[str]:
         return [item.value for item in cls]
@@ -311,9 +311,7 @@ class JobEvent(Base):
     job: Mapped[Job] = relationship(back_populates="events")
     attempt: Mapped[Attempt | None] = relationship(back_populates="events")
 
-    __table_args__ = (
-        Index("ix_job_events_job_created", "job_id", text("created_at DESC")),
-    )
+    __table_args__ = (Index("ix_job_events_job_created", "job_id", text("created_at DESC")),)
 
 
 class OutboxEvent(Base):

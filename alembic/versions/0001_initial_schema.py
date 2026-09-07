@@ -4,8 +4,8 @@ Revision ID: 0001_initial_schema
 Revises:
 """
 
-from alembic import op
 import sqlalchemy as sa
+from alembic import op
 from sqlalchemy.dialects import postgresql
 
 revision = "0001_initial_schema"
@@ -60,10 +60,22 @@ def upgrade() -> None:
         sa.Column("gpu_capacity", sa.Integer, nullable=False),
         sa.Column("capabilities", json_type, nullable=False),
         sa.Column("last_heartbeat_at", sa.DateTime(timezone=True)),
-        sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.text("now()"), nullable=False),
-        sa.Column("updated_at", sa.DateTime(timezone=True), server_default=sa.text("now()"), nullable=False),
+        sa.Column(
+            "created_at",
+            sa.DateTime(timezone=True),
+            server_default=sa.text("now()"),
+            nullable=False,
+        ),
+        sa.Column(
+            "updated_at",
+            sa.DateTime(timezone=True),
+            server_default=sa.text("now()"),
+            nullable=False,
+        ),
         sa.CheckConstraint("cpu_capacity >= 0", name="ck_workers_cpu_capacity_nonnegative"),
-        sa.CheckConstraint("memory_capacity_mb >= 0", name="ck_workers_memory_capacity_nonnegative"),
+        sa.CheckConstraint(
+            "memory_capacity_mb >= 0", name="ck_workers_memory_capacity_nonnegative"
+        ),
         sa.CheckConstraint("gpu_capacity >= 0", name="ck_workers_gpu_capacity_nonnegative"),
         sa.UniqueConstraint("name", name="uq_workers_name"),
     )
@@ -83,8 +95,18 @@ def upgrade() -> None:
         sa.Column("required_capabilities", json_type, nullable=False),
         sa.Column("status", enum("job_status"), nullable=False),
         sa.Column("max_retries", sa.Integer, nullable=False),
-        sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.text("now()"), nullable=False),
-        sa.Column("updated_at", sa.DateTime(timezone=True), server_default=sa.text("now()"), nullable=False),
+        sa.Column(
+            "created_at",
+            sa.DateTime(timezone=True),
+            server_default=sa.text("now()"),
+            nullable=False,
+        ),
+        sa.Column(
+            "updated_at",
+            sa.DateTime(timezone=True),
+            server_default=sa.text("now()"),
+            nullable=False,
+        ),
         sa.CheckConstraint("priority >= 0 AND priority <= 100", name="ck_jobs_priority_range"),
         sa.CheckConstraint("cpu_required >= 0", name="ck_jobs_cpu_required_nonnegative"),
         sa.CheckConstraint("memory_required_mb >= 0", name="ck_jobs_memory_required_nonnegative"),
@@ -108,8 +130,18 @@ def upgrade() -> None:
         sa.Column("finished_at", sa.DateTime(timezone=True)),
         sa.Column("exit_code", sa.Integer),
         sa.Column("error_message", sa.Text),
-        sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.text("now()"), nullable=False),
-        sa.Column("updated_at", sa.DateTime(timezone=True), server_default=sa.text("now()"), nullable=False),
+        sa.Column(
+            "created_at",
+            sa.DateTime(timezone=True),
+            server_default=sa.text("now()"),
+            nullable=False,
+        ),
+        sa.Column(
+            "updated_at",
+            sa.DateTime(timezone=True),
+            server_default=sa.text("now()"),
+            nullable=False,
+        ),
         sa.CheckConstraint("attempt_number > 0", name="ck_attempts_attempt_number_positive"),
         sa.ForeignKeyConstraint(["job_id"], ["jobs.id"], ondelete="CASCADE"),
         sa.ForeignKeyConstraint(["worker_id"], ["workers.id"], ondelete="SET NULL"),
@@ -124,7 +156,12 @@ def upgrade() -> None:
         sa.Column("attempt_id", uuid_type, nullable=False),
         sa.Column("worker_id", uuid_type, nullable=False),
         sa.Column("status", enum("assignment_status"), nullable=False),
-        sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.text("now()"), nullable=False),
+        sa.Column(
+            "created_at",
+            sa.DateTime(timezone=True),
+            server_default=sa.text("now()"),
+            nullable=False,
+        ),
         sa.Column("delivered_at", sa.DateTime(timezone=True)),
         sa.Column("acknowledged_at", sa.DateTime(timezone=True)),
         sa.Column("completed_at", sa.DateTime(timezone=True)),
@@ -142,7 +179,12 @@ def upgrade() -> None:
         sa.Column("memory_reserved_mb", sa.Integer, nullable=False),
         sa.Column("gpu_reserved", sa.Integer, nullable=False),
         sa.Column("status", enum("reservation_status"), nullable=False),
-        sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.text("now()"), nullable=False),
+        sa.Column(
+            "created_at",
+            sa.DateTime(timezone=True),
+            server_default=sa.text("now()"),
+            nullable=False,
+        ),
         sa.Column("released_at", sa.DateTime(timezone=True)),
         sa.CheckConstraint("cpu_reserved >= 0", name="ck_reservations_cpu_nonnegative"),
         sa.CheckConstraint("memory_reserved_mb >= 0", name="ck_reservations_memory_nonnegative"),
@@ -168,7 +210,9 @@ def upgrade() -> None:
         "worker_heartbeats",
         sa.Column("id", uuid_type, primary_key=True),
         sa.Column("worker_id", uuid_type, nullable=False),
-        sa.Column("timestamp", sa.DateTime(timezone=True), server_default=sa.text("now()"), nullable=False),
+        sa.Column(
+            "timestamp", sa.DateTime(timezone=True), server_default=sa.text("now()"), nullable=False
+        ),
         sa.Column("cpu_usage", sa.Integer, nullable=False),
         sa.Column("memory_usage_mb", sa.Integer, nullable=False),
         sa.Column("gpu_usage", sa.Integer, nullable=False),
@@ -191,7 +235,12 @@ def upgrade() -> None:
         sa.Column("attempt_id", uuid_type),
         sa.Column("event_type", sa.String(100), nullable=False),
         sa.Column("metadata", json_type, nullable=False),
-        sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.text("now()"), nullable=False),
+        sa.Column(
+            "created_at",
+            sa.DateTime(timezone=True),
+            server_default=sa.text("now()"),
+            nullable=False,
+        ),
         sa.ForeignKeyConstraint(["job_id"], ["jobs.id"], ondelete="CASCADE"),
         sa.ForeignKeyConstraint(["attempt_id"], ["attempts.id"], ondelete="SET NULL"),
     )
@@ -206,7 +255,12 @@ def upgrade() -> None:
         sa.Column("id", uuid_type, primary_key=True),
         sa.Column("event_type", sa.String(100), nullable=False),
         sa.Column("payload", json_type, nullable=False),
-        sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.text("now()"), nullable=False),
+        sa.Column(
+            "created_at",
+            sa.DateTime(timezone=True),
+            server_default=sa.text("now()"),
+            nullable=False,
+        ),
         sa.Column("published_at", sa.DateTime(timezone=True)),
         sa.Column("retry_count", sa.Integer, nullable=False),
         sa.Column("last_error", sa.Text),
