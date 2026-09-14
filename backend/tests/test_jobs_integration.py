@@ -64,7 +64,7 @@ def _job_payload(name: str) -> dict[str, object]:
     }
 
 
-async def _persist_job() -> Job:
+async def _persist_job(status: JobStatus = JobStatus.QUEUED) -> Job:
     job = Job(
         id=uuid4(),
         name="retrievable-api-integration-job",
@@ -75,7 +75,7 @@ async def _persist_job() -> Job:
         memory_required_mb=1024,
         gpu_required=1,
         required_capabilities=["python", "cuda"],
-        status=JobStatus.QUEUED,
+        status=status,
         max_retries=4,
     )
     async with AsyncSessionFactory() as session:
@@ -520,3 +520,140 @@ async def test_list_jobs_returns_empty_list_when_no_jobs_exist(clean_database: N
 
     assert response.status_code == 200
     assert response.json() == []
+
+
+@pytest.mark.asyncio
+async def test_cancel_queued_job_persists_status_and_events(
+    clean_database: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    job = await _persist_job()
+    publish = AsyncMock()
+    monkeypatch.setattr(RedisStreams, "publish", publish)
+
+    app.dependency_overrides[get_session] = _session_override
+    try:
+        with TestClient(app) as client:
+            response = client.post(f"/api/v1/jobs/{job.id}/cancel")
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    response_data = response.json()
+    assert response_data["id"] == str(job.id)
+    assert response_data["status"] == JobStatus.CANCELLED.value
+
+    async with AsyncSessionFactory() as verification_session:
+        persisted_job = await verification_session.get(Job, job.id)
+        job_events = list(
+            await verification_session.scalars(
+                select(JobEvent).where(
+                    JobEvent.job_id == job.id,
+                    JobEvent.event_type == "JOB_CANCELLED",
+                )
+            )
+        )
+        outbox_events = list(
+            await verification_session.scalars(
+                select(OutboxEvent).where(
+                    OutboxEvent.payload["job_id"].astext == str(job.id),
+                    OutboxEvent.event_type == "JOB_CANCELLED",
+                )
+            )
+        )
+
+    assert persisted_job is not None
+    assert persisted_job.status == JobStatus.CANCELLED
+    assert len(job_events) == 1
+    assert job_events[0].event_type == "JOB_CANCELLED"
+    assert len(outbox_events) == 1
+
+    outbox_event = outbox_events[0]
+    assert outbox_event.event_type == "JOB_CANCELLED"
+    assert outbox_event.published_at is None
+    assert outbox_event.payload["job_id"] == str(job.id)
+    assert UUID(outbox_event.payload["event_id"])
+    assert outbox_event.payload["created_at"]
+    publish.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_cancel_unknown_job_returns_not_found_without_events(clean_database: None) -> None:
+    unknown_job_id = uuid4()
+    app.dependency_overrides[get_session] = _session_override
+    try:
+        with TestClient(app) as client:
+            response = client.post(f"/api/v1/jobs/{unknown_job_id}/cancel")
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 404
+    assert response.json() == {"detail": "Job not found"}
+
+    async with AsyncSessionFactory() as verification_session:
+        job_events = list(
+            await verification_session.scalars(
+                select(JobEvent).where(JobEvent.job_id == unknown_job_id)
+            )
+        )
+        outbox_events = list(
+            await verification_session.scalars(
+                select(OutboxEvent).where(
+                    OutboxEvent.payload["job_id"].astext == str(unknown_job_id),
+                )
+            )
+        )
+
+    assert job_events == []
+    assert outbox_events == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "job_status",
+    [
+        JobStatus.ASSIGNED,
+        JobStatus.RUNNING,
+        JobStatus.SUCCEEDED,
+        JobStatus.FAILED,
+        JobStatus.CANCELLED,
+    ],
+)
+async def test_cancel_non_queued_job_returns_conflict_without_events(
+    clean_database: None,
+    job_status: JobStatus,
+) -> None:
+    job = await _persist_job(status=job_status)
+    app.dependency_overrides[get_session] = _session_override
+    try:
+        with TestClient(app) as client:
+            response = client.post(f"/api/v1/jobs/{job.id}/cancel")
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 409
+    assert response.json() == {"detail": "Only queued jobs can be cancelled"}
+
+    async with AsyncSessionFactory() as verification_session:
+        persisted_job = await verification_session.get(Job, job.id)
+        job_events = list(
+            await verification_session.scalars(
+                select(JobEvent).where(
+                    JobEvent.job_id == job.id,
+                    JobEvent.event_type == "JOB_CANCELLED",
+                )
+            )
+        )
+        outbox_events = list(
+            await verification_session.scalars(
+                select(OutboxEvent).where(
+                    OutboxEvent.payload["job_id"].astext == str(job.id),
+                    OutboxEvent.event_type == "JOB_CANCELLED",
+                )
+            )
+        )
+
+    assert persisted_job is not None
+    assert persisted_job.status == job_status
+    assert job_events == []
+    assert outbox_events == []

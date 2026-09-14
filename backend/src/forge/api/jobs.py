@@ -5,7 +5,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from forge.api.schemas.jobs import JobCreate, JobResponse, JobUpdate
-from forge.db.models import Job, JobEvent
+from forge.db.models import Job, JobEvent, JobStatus
 from forge.db.session import get_session
 from forge.messaging.redis_streams import SchedulingEvent
 from forge.outbox.service import add_outbox_event, scheduling_event_payload
@@ -114,6 +114,55 @@ async def update_job(
         event_type=event.event_type,
         payload=scheduling_event_payload(event),
     )
+    try:
+        await session.commit()
+    except Exception:
+        await session.rollback()
+        raise
+
+    await session.refresh(job)
+
+    return job
+
+
+@router.post("/{job_id}/cancel", response_model=JobResponse)
+async def cancel_job(
+    job_id: UUID,
+    session: AsyncSession = Depends(get_session),
+) -> Job:
+    result = await session.execute(select(Job).where(Job.id == job_id))
+    job = result.scalar_one_or_none()
+
+    if job is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Job not found",
+        )
+
+    if job.status != JobStatus.QUEUED:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Only queued jobs can be cancelled",
+        )
+    job.status = JobStatus.CANCELLED
+    job_event = JobEvent(
+        job_id=job.id,
+        event_type="JOB_CANCELLED",
+    )
+    session.add(job_event)
+    event = SchedulingEvent(
+        event_id=uuid4(),
+        event_type="JOB_CANCELLED",
+        job_id=job.id,
+        created_at=job.created_at,
+    )
+
+    add_outbox_event(
+        session,
+        event_type=event.event_type,
+        payload=scheduling_event_payload(event),
+    )
+
     try:
         await session.commit()
     except Exception:

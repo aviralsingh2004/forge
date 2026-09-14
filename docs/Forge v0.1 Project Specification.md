@@ -1284,9 +1284,22 @@ Frontend work can begin once the primary APIs are stable, but it should not bloc
 
 # 41. v0.1 Implementation Phases
 
-## Phase 0 — Repository
+Forge should be implemented as a sequence of small, verifiable milestones. Each
+phase should leave the repository runnable and should add tests before the next
+distributed-system boundary is introduced. PostgreSQL remains the source of
+truth throughout the plan; Redis Streams carries scheduling events but does not
+own business state.
 
-Create:
+## Phase 0 — Repository and Tooling
+
+### Objectives
+
+Create a reproducible repository and local development environment.
+
+### Work
+
+1. Initialize Git with `git init`.
+2. Create the project layout:
 
 ```text
 forge/
@@ -1295,146 +1308,408 @@ forge/
 ├── deploy/
 ├── docs/
 ├── docker-compose.yml
+├── .env
 ├── .env.example
 ├── README.md
 └── Makefile
 ```
 
-Set up:
+3. Set up Python with `uv` or Poetry, using a supported Python version.
+4. Configure the package, test discovery, and import paths.
+5. Add Ruff, pytest, pytest-asyncio, and pre-commit.
+6. Add Docker and Docker Compose configuration for local services.
+7. Put `.env` and other secret-bearing files in `.gitignore`.
+8. Document every required environment variable in `.env.example` without
+  committing real credentials.
+9. Add basic commands for install, lint, format, test, migration, and Compose
+  startup.
 
-- Python
-- dependency management
-- Ruff
-- pytest
-- pre-commit
-- Docker
-- Docker Compose
+### Verification gate
 
----
+The following should work from a clean checkout:
 
-## Phase 1 — PostgreSQL
+```text
+uv sync
+uv run ruff check .
+uv run pytest
+docker compose up
+```
 
-Implement:
+`docker compose up` must start the infrastructure services without requiring
+secrets in Git. Application containers may be added as their phases are ready.
 
-- SQLAlchemy models
-- Alembic
-- migrations
-- constraints
-- indexes
-- database connection management
+## Phase 1 — PostgreSQL Persistence
 
-Verify CRUD for initial entities.
+### Objectives
 
----
+Build the durable domain model and establish PostgreSQL as the authoritative
+state store.
+
+### Work
+
+1. Configure environment-backed PostgreSQL settings and an async SQLAlchemy
+  engine/session factory.
+2. Define the initial tables:
+
+```text
+workers
+jobs
+attempts
+assignments
+reservations
+worker_heartbeats
+job_events
+outbox_events
+```
+
+3. Add the state enums and timestamp fields.
+4. Add foreign keys with deliberate delete behavior.
+5. Add CHECK constraints for non-negative resources, valid priorities, retry
+  counts, and valid attempt numbers.
+6. Add unique constraints for worker names, attempt numbers per Job, and one
+  active reservation or assignment where required.
+7. Add indexes for status, scheduling order, worker lookup, and event history.
+8. Create and verify the first Alembic migration.
+9. Document how to upgrade, downgrade, and inspect the schema.
+
+### Tests and verification
+
+- Create and retrieve a `Worker` and a `Job`.
+- Verify relationships and enum defaults.
+- Verify constraint and uniqueness failures.
+- Run the tests against PostgreSQL rather than replacing the database with an
+  in-memory substitute.
 
 ## Phase 2 — Redis Streams
 
-Implement:
+### Objectives
 
-- Redis connection
-- stream creation
-- consumer group
-- event publishing
-- event consumption
-- acknowledgement
-- pending-message handling
+Introduce Redis as the scheduling event mechanism while keeping PostgreSQL as
+the source of truth.
 
----
+### Work
 
-## Phase 3 — Outbox
+1. Configure an async Redis client from environment settings.
+2. Use the initial stream:
 
-Implement:
+```text
+forge:scheduling
+```
 
-- OutboxEvent model
-- transactional Job + Outbox insertion
-- Outbox Publisher
-- retry behavior
+3. Create the consumer group:
 
----
+```text
+scheduler-group
+```
 
-## Phase 4 — FastAPI
+4. Implement event serialization and publishing with event ID, type, Job ID,
+  and creation time.
+5. Implement consumer-group reads, acknowledgements, pending-message lookup,
+  and clean shutdown.
+6. Keep Redis connection and health failures explicit and observable.
 
-Implement:
+### Tests and verification
+
+- Publish and read a scheduling event.
+- Verify consumer-group acknowledgement.
+- Verify pending-message inspection.
+- Verify Redis-unavailable behavior.
+- Do not store authoritative Job, Worker, reservation, or assignment state in
+  Redis.
+
+## Phase 3 — Outbox Publisher
+
+### Objectives
+
+Guarantee that a committed business change has a corresponding scheduling
+event without publishing to Redis inside the request transaction.
+
+### Work
+
+1. Keep `OutboxEvent` in PostgreSQL with publication state, retry count, and
+  last error.
+2. Add helpers that append an outbox row to the caller's transaction.
+3. Implement the Outbox Publisher as a separate process or service loop.
+4. Select unpublished events in creation order.
+5. Publish the event to Redis only after the PostgreSQL transaction commits.
+6. Mark successful events as published.
+7. Record failures and implement bounded retry/backoff behavior.
+8. Make publishing idempotent enough to tolerate process restarts and
+  at-least-once delivery.
+
+### Tests and verification
+
+- Job and OutboxEvent commit together.
+- A transaction rollback removes both records.
+- The API does not call Redis directly.
+- Successful publication marks the event published.
+- Failed publication retains the event and records retry information.
+
+## Phase 4 — FastAPI Control Plane
+
+### Objectives
+
+Expose the first HTTP API while keeping handlers small and explicit.
+
+### Work order
+
+1. Create the FastAPI application and route registration.
+2. Add liveness and PostgreSQL readiness endpoints.
+3. Add Job request/response schemas with explicit validation.
+4. Implement Job creation transactionally with its OutboxEvent.
+5. Implement Job retrieval and ordered Job listing.
+6. Implement partial Job updates with a `JobEvent` and `OutboxEvent`.
+7. Implement Job cancellation only after the state-transition rules are
+  defined and tested.
+8. Add worker registration and worker lookup endpoints.
+9. Add heartbeat handling.
+10. Add assignment delivery and attempt status endpoints only after the Worker
+   contract is stable.
+
+### Initial API surface
 
 ```text
 POST /api/v1/jobs
-GET /api/v1/jobs/{id}
-POST /api/v1/jobs/{id}/cancel
+GET  /api/v1/jobs
+GET  /api/v1/jobs/{job_id}
+PATCH /api/v1/jobs/{job_id}
+POST /api/v1/jobs/{job_id}/cancel
 
+GET  /api/v1/workers
+GET  /api/v1/workers/{worker_id}
 POST /api/v1/workers/register
-POST /api/v1/workers/{id}/heartbeat
-
-POST /api/v1/workers/{id}/assignments
-
-POST /api/v1/attempts/{id}/status
+POST /api/v1/workers/{worker_id}/heartbeat
+POST /api/v1/workers/{worker_id}/assignments
+POST /api/v1/attempts/{attempt_id}/status
 
 GET /health/live
 GET /health/ready
 ```
 
----
+### Tests and verification
 
-## Phase 5 — Worker
+- Exercise every endpoint through FastAPI's HTTP test client.
+- Use PostgreSQL integration tests for persistence and transaction checks.
+- Verify validation errors do not create database records.
+- Verify read-only endpoints do not create events or modify state.
+- Verify API requests do not publish directly to Redis.
+- Verify health endpoints return `200` for healthy dependencies and `503` for
+  unavailable required dependencies.
 
-Implement:
+## Phase 5 — Worker Process
+
+### Objectives
+
+Build the first executable Worker and define the push-based execution
+contract.
+
+### Work
+
+1. Create a Worker process with its own configuration and lifecycle.
+2. Register the Worker with capacity, capabilities, version, and status.
+3. Return the Worker ID and heartbeat interval from registration.
+4. Run a heartbeat loop and report capacity, usage, and active attempts.
+5. Receive assignments through HTTP push.
+6. Validate an assignment before execution and acknowledge its state.
+7. Report attempt start, running, success, failure, and cancellation states.
+8. Shut down cleanly without abandoning local execution state.
+
+### Verification gate
+
+One Worker can register, send heartbeats, receive a test assignment, and report
+the assignment lifecycle without a Scheduler choosing work locally.
+
+## Phase 6 — Scheduler v0.1
+
+### Objectives
+
+Build the scheduling decision path from Redis event to transactional database
+assignment.
+
+### Work
+
+Create the scheduler as focused modules:
 
 ```text
-registration
-heartbeat loop
-assignment handling
-Docker executor
-status reporting
+scheduler/
+├── consumer.py
+├── engine.py
+├── job_selector.py
+├── worker_filter.py
+├── scorer.py
+├── allocator.py
+└── recovery.py
 ```
 
----
-
-## Phase 6 — Scheduler
-
-Implement:
+1. Consume scheduling events from `forge:scheduling` using
+  `scheduler-group`.
+2. Select only Jobs that are still `QUEUED`.
+3. Order Jobs by priority and FIFO creation time.
+4. Filter Workers by health, status, capabilities, and available resources.
+5. Score feasible Workers using the initial configurable weights:
 
 ```text
-Redis consumer
-Job selection
-Worker filtering
-Worker scoring
-resource allocation
-reservation
-assignment
+resource fit: 50%
+load:          30%
+fragmentation: 20%
 ```
 
----
+6. Pass the selected Job and Worker to the allocator.
+7. Acknowledge the Redis event only after the database decision is safely
+  committed or is known to be obsolete.
 
-## Phase 7 — Reliability
+## Phase 7 — Transactional Resource Allocation
 
-Implement:
+### Objectives
 
-- idempotency
-- retries
-- Redis failure recovery
-- Scheduler failure recovery
-- Worker failure detection
-- stale assignments
-- resource release
+Prevent concurrent Scheduler instances from over-allocating a Worker.
 
----
+### Allocation transaction
 
-## Phase 8 — Nginx
+Implement the following inside one PostgreSQL transaction:
 
-Put Nginx in front of FastAPI.
+```text
+BEGIN
+  lock Worker
+  lock Job
+  recalculate available resources
+  verify Job is still QUEUED
+  verify resources still fit
+  create Attempt
+  create Reservation
+  create Assignment
+  update Job
+  create JobEvent
+COMMIT
+```
 
-Verify:
+The transaction must be safe when two Scheduler instances compete for the same
+Worker. Reservations must be derived from committed database state, not cached
+Redis state.
+
+### Concurrency gate
+
+With one Worker providing 8 CPU and two Jobs requiring 6 CPU each, two
+simultaneous allocation attempts must produce:
+
+```text
+one Job: ASSIGNED
+one Job: QUEUED
+```
+
+The system must never reserve 12 CPU on an 8 CPU Worker.
+
+## Phase 8 — Docker Executor
+
+### Objectives
+
+Execute assignments on the Worker with explicit resource limits.
+
+### Work
+
+1. Use a Docker SDK or equivalent supported client.
+2. Translate the assignment image and command into a container.
+3. Apply CPU and memory limits.
+4. Add GPU configuration only when the Worker advertises GPU capability and the
+  Job requires it.
+5. Capture exit code, output metadata, and failure reason.
+6. Ensure containers are cleaned up after completion.
+7. Keep `gpu_required = 0` fully functional without GPU support.
+
+GPU execution depends on the Windows NVIDIA driver, WSL2 GPU support, and Docker
+Desktop integration. CPU and RAM execution must not depend on that setup.
+
+## Phase 9 — Reliability and Recovery
+
+### Objectives
+
+Make delivery and execution behavior safe under process and infrastructure
+failures.
+
+### Work
+
+1. Make event handling idempotent.
+2. Recover pending Redis messages after Scheduler failure.
+3. Handle a Scheduler crash before and after a database commit.
+4. Detect Worker heartbeat expiry and mark Workers unavailable.
+5. Retry assignment delivery when a Worker is unreachable.
+6. Keep failed or stale assignments visible for recovery.
+7. Release reservations on terminal attempt states and detected Worker loss.
+8. Prevent duplicate Attempts, Reservations, Assignments, and state transitions.
+
+### Failure tests
+
+Test at minimum:
+
+```text
+Redis unavailable
+PostgreSQL unavailable
+Scheduler crash before commit
+Scheduler crash after commit
+Worker unavailable
+Worker heartbeat timeout
+Worker assignment HTTP failure
+Container failure
+```
+
+## Phase 10 — Nginx and Compose Topology
+
+### Objectives
+
+Move from direct service ports to a production-like local topology.
+
+### Work
+
+1. Put Nginx in front of FastAPI.
+2. Proxy `/api/*` and health endpoints to the API service.
+3. Preserve useful request and upstream error logs.
+4. Verify:
 
 ```text
 localhost/api/v1/...
+localhost/health/live
+localhost/health/ready
 ```
 
-works through Nginx.
+5. Keep Docker Compose as the primary local orchestration mechanism.
+6. Add profiles only when components exist and have a real operational use:
 
----
+```text
+default
+gpu
+monitoring
+debug
+```
 
-## Phase 9 — End-to-End
+7. Do not introduce Kubernetes before the complete local Compose flow is
+  reliable.
 
-The following must work:
+## Phase 11 — Configuration Management
+
+Introduce `confd` only when dynamic configuration solves a demonstrated problem.
+Potential configuration targets include Scheduler weights, Worker heartbeat
+intervals, resource policies, and Nginx upstreams. The configuration flow
+should be:
+
+```text
+configuration source
+      |
+      v
+    confd
+      |
+      v
+generated configuration
+      |
+      v
+ Forge or Nginx
+```
+
+Do not build a custom enable/disable CLI before the underlying configuration
+and Compose profiles are useful independently.
+
+## Phase 12 — End-to-End v0.1 Milestone
+
+The complete local demonstration must work:
 
 ```text
 Submit Job
@@ -1639,3 +1914,370 @@ SUCCESS
 ```
 
 This is the baseline from which future Forge versions will evolve.
+
+# Deferred / Revisit Later
+
+Forge v0.1 intentionally simplifies or postpones several features because the
+components and reliability mechanisms they depend on are not yet implemented.
+These items are deferred deliberately, not forgotten.
+
+## 1. Job Cancellation Beyond QUEUED
+
+### Current v0.1 behavior
+
+- `QUEUED -> CANCELLED` is supported.
+- `ASSIGNED`, `RUNNING`, `SUCCEEDED`, `FAILED`, and `CANCELLED` Jobs cannot
+  currently be cancelled and return `409 Conflict`.
+
+### Reason for deferral
+
+`ASSIGNED` and `RUNNING` cancellation requires Worker coordination and, for
+running Jobs, Docker/container lifecycle control.
+
+### Revisit when
+
+- Worker execution exists.
+- The Docker executor exists.
+- Assignment and Attempt lifecycles are implemented.
+
+### Expected future flow
+
+```text
+Cancel request
+  |
+  v
+Control Plane
+  |
+  v
+Worker
+  |
+  v
+Stop Docker container
+  |
+  v
+Update Attempt/Assignment
+  |
+  v
+Release Reservation
+  |
+  v
+Job CANCELLED
+```
+
+## 2. Worker Registration Enhancements
+
+### Current v0.1 behavior
+
+- Worker registration creates a Worker in PostgreSQL.
+- Newly registered Workers start in `REGISTERING`.
+- Registration does not automatically transition a Worker to `READY`.
+
+### Deferred concerns
+
+- Worker authentication and identity verification.
+- Registration tokens or credentials.
+- Automatic readiness validation.
+- Docker availability verification.
+- Machine and resource discovery.
+- Capability verification.
+- Re-registration and reconciliation of an existing Worker.
+
+### Revisit when
+
+The actual Worker agent is implemented in Phase 5.
+
+## 3. Duplicate Worker Registration API Semantics
+
+### Current v0.1 behavior
+
+Worker names are protected by a PostgreSQL unique constraint. Duplicate names
+currently rely on that database constraint.
+
+### Deferred
+
+- Decide whether the API should explicitly translate duplicate registration
+  into a clean `409 Conflict`.
+- Define Worker identity and re-registration semantics once real Worker agents
+  register automatically.
+
+## 4. Outbox Duplicate Publication / Event Idempotency
+
+### Current v0.1 behavior
+
+- Outbox events have unique event IDs.
+- The Outbox Publisher tracks `published_at`, `retry_count`, and `last_error`.
+- Publication is retried through later publisher runs.
+- Full idempotent delivery is not implemented yet.
+
+### Known failure scenario
+
+```text
+Outbox event
+  |
+  v
+Redis publish succeeds
+  |
+  v
+Process crashes before published_at is persisted
+  |
+  v
+Event may be published again
+```
+
+### Deferred
+
+- Consumer-side event idempotency.
+- Duplicate event detection using `event_id`.
+- Safe handling of duplicate scheduling events.
+- Stronger Outbox claiming and locking if multiple Publishers are introduced.
+- Retry backoff and retry policy.
+
+### Revisit in
+
+Phase 7 — Reliability.
+
+## 5. Redis Failure Recovery
+
+### Current v0.1 behavior
+
+Redis Streams provides asynchronous event delivery. Basic connection,
+publishing, consumer groups, acknowledgement, and pending-message handling
+exist.
+
+### Deferred
+
+- Robust Redis outage recovery.
+- Consumer reconnection strategy.
+- Publisher recovery.
+- Pending-message claiming and reprocessing policy.
+- Backoff and retry policies.
+- Handling Redis recovery while the Scheduler is running.
+
+### Revisit in
+
+Phase 7 — Reliability.
+
+## 6. Scheduler Failure Recovery
+
+### Current v0.1 behavior
+
+The Scheduler is responsible for consuming scheduling events and making
+scheduling decisions.
+
+### Deferred
+
+- Scheduler crash recovery.
+- Multiple Scheduler instances.
+- Concurrent scheduling coordination.
+- Recovery of partially completed scheduling operations.
+- Reconciliation of Jobs, Attempts, Assignments, and Reservations after
+  Scheduler failure.
+
+### Revisit in
+
+Phase 7 — Reliability.
+
+## 7. Worker Failure Detection and Stale State
+
+### Current v0.1 behavior
+
+- Workers have heartbeat support.
+- `last_heartbeat_at` is stored.
+
+### Deferred
+
+- Heartbeat timeout policy.
+- Transitioning Workers to `OFFLINE`.
+- Detecting stale Assignments.
+- Recovering Jobs from failed Workers.
+- Releasing resources after Worker failure.
+- Reassigning interrupted work according to retry policy.
+
+### Revisit in
+
+Phase 7 — Reliability.
+
+## 8. Running Job Cancellation and Docker Lifecycle
+
+### Current v0.1 behavior
+
+Running-Job cancellation is not implemented.
+
+### Deferred
+
+- Sending cancellation commands to Workers.
+- Docker container termination.
+- Graceful versus forced container shutdown.
+- Cancellation timeouts.
+- Correct Attempt and Assignment state transitions.
+- Reservation release after cancellation.
+
+### Revisit when
+
+- Phase 5 Worker and Docker execution are implemented.
+- Phase 7 Reliability is implemented.
+
+## 9. Docker Executor Enhancements
+
+### Current v0.1 goal
+
+The Worker will execute Jobs through a Docker executor.
+
+### Future/deferred concerns
+
+- CPU limits.
+- Memory limits.
+- GPU access.
+- Container lifecycle management.
+- Exit-code handling.
+- stdout/stderr collection.
+- Execution timeouts.
+- Container cleanup.
+- Executor failures.
+- Image-pull failures.
+- Docker daemon failures.
+
+These should be implemented progressively during Phase 5 and hardened during
+Phase 7.
+
+## 10. Scheduler Concurrency and Resource Allocation Hardening
+
+### Current v0.1 goal
+
+- The Scheduler selects a queued Job.
+- It filters eligible Workers.
+- It scores Workers.
+- It allocates resources.
+- It creates Reservations and Assignments.
+
+### Deferred
+
+- Concurrent Scheduler instances.
+- Race conditions between Schedulers.
+- Stronger locking strategy.
+- Reservation expiration.
+- Reservation reconciliation.
+- Resource leak detection.
+- Fragmentation optimization beyond the initial scoring model.
+
+### Revisit during
+
+- Phase 6 Scheduler implementation.
+- Phase 7 Reliability hardening.
+
+## 11. API Idempotency
+
+### Deferred
+
+- Idempotency keys for Job creation.
+- Idempotent Worker registration.
+- Idempotent cancellation.
+- Idempotent Assignment and status operations.
+- Duplicate request handling after client or network retries.
+
+### Revisit in
+
+Phase 7 — Reliability.
+
+## 12. Attempt Retry Semantics
+
+### Current v0.1
+
+Jobs contain `max_retries`.
+
+### Deferred
+
+- Exact retry policy.
+- Retryable versus non-retryable failures.
+- Attempt numbering semantics.
+- Backoff.
+- Requeue behavior.
+- Resource release before retry.
+- Worker failure versus application failure classification.
+
+### Revisit in
+
+Phase 7 — Reliability.
+
+## 13. Assignment and Reservation Recovery
+
+### Deferred
+
+- Detecting stale Assignments.
+- Detecting Reservations that outlive their Assignments.
+- Automatic resource release.
+- Reconciliation between Job, Attempt, Assignment, and Reservation state.
+- Recovery after process, database, Scheduler, or Worker failures.
+
+### Revisit in
+
+Phase 7 — Reliability.
+
+## 14. Authentication and Authorization
+
+Authentication and authorization are not part of the current v0.1 execution
+path.
+
+### Deferred
+
+- API authentication.
+- Worker authentication.
+- Authorization and RBAC.
+- Secure Worker-to-Control-Plane communication.
+- Credential and token management.
+
+### Revisit when
+
+The core v0.1 execution lifecycle is working.
+
+## 15. Observability
+
+### Deferred
+
+- Structured logging.
+- Metrics.
+- Distributed tracing.
+- Scheduler metrics.
+- Worker metrics.
+- Job and Attempt execution metrics.
+- Redis and PostgreSQL operational metrics.
+- Alerting.
+
+These can be added after the core lifecycle is operational.
+
+## 16. Production Hardening
+
+The initial Forge v0.1 implementation intentionally prioritizes learning the
+architecture and completing the first end-to-end lifecycle.
+
+### Deferred production-hardening concerns
+
+- Advanced retry policies.
+- Backpressure.
+- Rate limiting.
+- Connection pool tuning.
+- Horizontal scaling.
+- High availability.
+- Disaster recovery.
+- Backup and restore procedures.
+- Security hardening.
+- Performance and load testing.
+- Chaos and failure testing.
+
+These should not block the first complete Forge lifecycle unless they expose a
+correctness issue.
+
+## Important Design Principle
+
+Deferred functionality is intentional, not forgotten.
+
+When implementing an early phase, prefer a simple implementation that is
+correct for the currently implemented architecture. Record functionality that
+depends on later components under this section rather than prematurely
+implementing it.
+
+When a deferred item becomes relevant, move it into the appropriate
+implementation phase and update this section to reflect its completed status.
+
+Do not introduce future-phase complexity into the current phase unless it is
+required for correctness of the current v0.1 milestone.
