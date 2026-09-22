@@ -4,8 +4,10 @@ from uuid import UUID, uuid4
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 
 from forge.api.schemas.workers import (
+    AssignmentDetailsResponse,
     AssignmentRequest,
     AssignmentResponse,
     WorkerHeartbeatRequest,
@@ -13,7 +15,7 @@ from forge.api.schemas.workers import (
     WorkerRegister,
     WorkerResponse,
 )
-from forge.db.models import Assignment, AssignmentStatus, Worker, WorkerHeartbeat
+from forge.db.models import Assignment, AssignmentStatus, Attempt, Worker, WorkerHeartbeat
 from forge.db.session import get_session
 
 router = APIRouter(prefix="/api/v1/workers", tags=["workers"])
@@ -114,6 +116,108 @@ async def deliver_assignment(
         )
     assignment.status = AssignmentStatus.DELIVERED
     assignment.delivered_at = datetime.now(UTC)
+
+    try:
+        await session.commit()
+    except Exception:
+        await session.rollback()
+        raise
+
+    await session.refresh(assignment)
+
+    return assignment
+
+
+@router.get(
+    "/{worker_id}/assignments/{assignment_id}",
+    response_model=AssignmentDetailsResponse,
+)
+async def get_assignment_details(
+    worker_id: UUID,
+    assignment_id: UUID,
+    session: AsyncSession = Depends(get_session),
+) -> AssignmentDetailsResponse:
+    result = await session.execute(select(Worker).where(Worker.id == worker_id))
+    worker = result.scalar_one_or_none()
+
+    if worker is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Worker not found",
+        )
+
+    result = await session.execute(
+        select(Assignment)
+        .options(selectinload(Assignment.attempt).selectinload(Attempt.job))
+        .where(Assignment.id == assignment_id)
+    )
+    assignment = result.scalar_one_or_none()
+
+    if assignment is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Assignment not found",
+        )
+    if assignment.worker_id != worker.id:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Assignment does not belong to worker",
+        )
+
+    job = assignment.attempt.job
+    return AssignmentDetailsResponse(
+        id=assignment.id,
+        attempt_id=assignment.attempt_id,
+        worker_id=assignment.worker_id,
+        status=assignment.status,
+        image=job.image,
+        command=job.command,
+        cpu_required=job.cpu_required,
+        memory_required_mb=job.memory_required_mb,
+        gpu_required=job.gpu_required,
+        timeout_seconds=None,
+    )
+
+
+@router.post(
+    "/{worker_id}/assignments/{assignment_id}/acknowledge",
+    response_model=AssignmentResponse,
+)
+async def acknowledge_assignment(
+    worker_id: UUID,
+    assignment_id: UUID,
+    session: AsyncSession = Depends(get_session),
+) -> AssignmentResponse:
+    result = await session.execute(select(Worker).where(Worker.id == worker_id))
+    worker = result.scalar_one_or_none()
+
+    if worker is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Worker not found",
+        )
+
+    result = await session.execute(select(Assignment).where(Assignment.id == assignment_id))
+    assignment = result.scalar_one_or_none()
+
+    if assignment is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Assignment not found",
+        )
+    if assignment.worker_id != worker.id:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Assignment does not belong to worker",
+        )
+    if assignment.status != AssignmentStatus.DELIVERED:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Assignment is not in DELIVERED state",
+        )
+
+    assignment.status = AssignmentStatus.ACKNOWLEDGED
+    assignment.acknowledged_at = datetime.now(UTC)
 
     try:
         await session.commit()

@@ -58,6 +58,19 @@ class AssignmentResponse(BaseModel):
     completed_at: datetime | None
 
 
+class AssignmentDetailsResponse(BaseModel):
+    id: UUID
+    attempt_id: UUID
+    worker_id: UUID
+    status: AssignmentStatus
+    image: str
+    command: list[str]
+    cpu_required: int
+    memory_required_mb: int
+    gpu_required: int
+    timeout_seconds: int | None
+
+
 class AttemptStatusRequest(BaseModel):
     status: AttemptStatus
     exit_code: int | None = None

@@ -662,3 +662,137 @@ async def test_deliver_assignment_only_succeeds_once(clean_database: None) -> No
     assert persisted_assignment.status == AssignmentStatus.DELIVERED
     assert persisted_assignment.delivered_at is not None
     assert abs(persisted_assignment.delivered_at - first_delivered_at).total_seconds() < 1
+
+
+@pytest.mark.asyncio
+async def test_acknowledge_delivered_assignment_persists_status_and_timestamp(
+    clean_database: None,
+) -> None:
+    worker, _, assignment = await _persist_assignment(status=AssignmentStatus.DELIVERED)
+    app.dependency_overrides[get_session] = _session_override
+    try:
+        with TestClient(app) as client:
+            response = client.post(
+                f"/api/v1/workers/{worker.id}/assignments/{assignment.id}/acknowledge"
+            )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    response_data = response.json()
+    assert response_data["id"] == str(assignment.id)
+    assert response_data["attempt_id"] == str(assignment.attempt_id)
+    assert response_data["worker_id"] == str(worker.id)
+    assert response_data["status"] == AssignmentStatus.ACKNOWLEDGED.value
+    assert response_data["acknowledged_at"] is not None
+
+    async with AsyncSessionFactory() as verification_session:
+        persisted_assignment = await verification_session.get(Assignment, assignment.id)
+
+    assert persisted_assignment is not None
+    assert persisted_assignment.status == AssignmentStatus.ACKNOWLEDGED
+    assert persisted_assignment.acknowledged_at is not None
+    assert persisted_assignment.acknowledged_at.tzinfo is not None
+    response_timestamp = datetime.fromisoformat(response_data["acknowledged_at"])
+    assert abs(persisted_assignment.acknowledged_at - response_timestamp).total_seconds() < 1
+
+
+@pytest.mark.asyncio
+async def test_acknowledge_assignment_unknown_worker_returns_not_found(
+    clean_database: None,
+) -> None:
+    worker, _, assignment = await _persist_assignment(status=AssignmentStatus.DELIVERED)
+    unknown_worker_id = uuid4()
+    assert unknown_worker_id != worker.id
+    app.dependency_overrides[get_session] = _session_override
+    try:
+        with TestClient(app) as client:
+            response = client.post(
+                f"/api/v1/workers/{unknown_worker_id}/assignments/{assignment.id}/acknowledge"
+            )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 404
+    assert response.json() == {"detail": "Worker not found"}
+
+
+@pytest.mark.asyncio
+async def test_acknowledge_unknown_assignment_returns_not_found(clean_database: None) -> None:
+    worker = await _persist_worker("acknowledge-unknown-assignment-worker")
+    unknown_assignment_id = uuid4()
+    app.dependency_overrides[get_session] = _session_override
+    try:
+        with TestClient(app) as client:
+            response = client.post(
+                f"/api/v1/workers/{worker.id}/assignments/{unknown_assignment_id}/acknowledge"
+            )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 404
+    assert response.json() == {"detail": "Assignment not found"}
+
+
+@pytest.mark.asyncio
+async def test_acknowledge_assignment_for_other_worker_returns_conflict(
+    clean_database: None,
+) -> None:
+    worker_a, _, assignment = await _persist_assignment(status=AssignmentStatus.DELIVERED)
+    worker_b = await _persist_worker("acknowledge-other-worker")
+    app.dependency_overrides[get_session] = _session_override
+    try:
+        with TestClient(app) as client:
+            response = client.post(
+                f"/api/v1/workers/{worker_b.id}/assignments/{assignment.id}/acknowledge"
+            )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 409
+    assert response.json() == {"detail": "Assignment does not belong to worker"}
+    assert worker_a.id != worker_b.id
+
+    async with AsyncSessionFactory() as verification_session:
+        persisted_assignment = await verification_session.get(Assignment, assignment.id)
+
+    assert persisted_assignment is not None
+    assert persisted_assignment.status == AssignmentStatus.DELIVERED
+    assert persisted_assignment.acknowledged_at is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "assignment_status",
+    [
+        AssignmentStatus.CREATED,
+        AssignmentStatus.ACKNOWLEDGED,
+        AssignmentStatus.COMPLETED,
+        AssignmentStatus.FAILED,
+        AssignmentStatus.CANCELLED,
+    ],
+)
+async def test_acknowledge_assignment_requires_delivered_state(
+    clean_database: None,
+    assignment_status: AssignmentStatus,
+) -> None:
+    worker, _, assignment = await _persist_assignment(status=assignment_status)
+    original_acknowledged_at = assignment.acknowledged_at
+    app.dependency_overrides[get_session] = _session_override
+    try:
+        with TestClient(app) as client:
+            response = client.post(
+                f"/api/v1/workers/{worker.id}/assignments/{assignment.id}/acknowledge"
+            )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 409
+    assert response.json() == {"detail": "Assignment is not in DELIVERED state"}
+
+    async with AsyncSessionFactory() as verification_session:
+        persisted_assignment = await verification_session.get(Assignment, assignment.id)
+
+    assert persisted_assignment is not None
+    assert persisted_assignment.status == assignment_status
+    assert persisted_assignment.acknowledged_at == original_acknowledged_at
