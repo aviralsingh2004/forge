@@ -8,6 +8,7 @@ from forge.db.models import (
     Attempt,
     AttemptStatus,
     Job,
+    JobEvent,
     JobStatus,
     Reservation,
     ReservationStatus,
@@ -29,7 +30,6 @@ class Scheduler:
                 Job.created_at.asc(),
             )
             .limit(1)
-            .with_for_update()
         )
         return result.scalar_one_or_none()
 
@@ -164,6 +164,7 @@ class Scheduler:
             select(Worker)
             .where(Worker.id == worker.id)
             .options(selectinload(Worker.reservations))
+            .execution_options(populate_existing=True)
             .with_for_update()
         )
         return result.scalar_one()
@@ -179,10 +180,14 @@ class Scheduler:
         )
 
     async def schedule_job(self, job: Job, worker: Worker) -> Assignment:
+        # Lock in a consistent order: Worker -> Job
+        locked_worker = await self.lock_worker(worker)
+
         locked_job = await self.session.get(
             Job,
             job.id,
             with_for_update=True,
+            populate_existing=True,
         )
 
         if locked_job is None:
@@ -191,15 +196,34 @@ class Scheduler:
         if locked_job.status != JobStatus.QUEUED:
             raise ValueError("Job is no longer queued")
 
-        locked_worker = await self.lock_worker(worker)
-
+        # Recalculate from active reservations after acquiring the Worker lock.
         if not self.validate_worker_resources(locked_job, locked_worker):
             raise ValueError("Worker no longer has sufficient resources")
 
-        attempt = await self.create_attempt(locked_job, locked_worker)
-        await self.create_reservation(locked_job, locked_worker, attempt)
-        assignment = await self.create_assignment(attempt, locked_worker)
+        attempt = await self.create_attempt(
+            locked_job,
+            locked_worker,
+        )
+
+        await self.create_reservation(
+            locked_job,
+            locked_worker,
+            attempt,
+        )
+
+        assignment = await self.create_assignment(
+            attempt,
+            locked_worker,
+        )
+
         self.mark_job_assigned(locked_job)
+
+        job_event = JobEvent(
+            job_id=locked_job.id,
+            attempt_id=attempt.id,
+            event_type="JOB_ASSIGNED",
+        )
+        self.session.add(job_event)
 
         await self.session.commit()
 

@@ -280,7 +280,7 @@ async def test_get_next_job_query_compilation_and_ordering() -> None:
     assert "WHERE jobs.status = :status_1" in compiled_sql or "WHERE jobs.status =" in compiled_sql
     assert "ORDER BY jobs.priority DESC, jobs.created_at ASC" in compiled_sql
     assert "LIMIT :param_1" in compiled_sql or "LIMIT 1" in compiled_sql
-    assert statement._for_update_arg is not None
+    assert statement._for_update_arg is None
 
 
 # ---------------------------------------------------------------------------
@@ -1022,9 +1022,9 @@ async def test_schedule_job_unit() -> None:
     assert job.status == JobStatus.ASSIGNED
     assert assignment.worker_id == worker_id
     assert assignment.status == AssignmentStatus.CREATED
-    session.get.assert_awaited_once_with(Job, job_id, with_for_update=True)
+    session.get.assert_awaited_once_with(Job, job_id, with_for_update=True, populate_existing=True)
     scheduler.lock_worker.assert_awaited_once_with(worker)
-    assert session.add.call_count == 3
+    assert session.add.call_count == 4
     assert session.flush.await_count == 3
     session.commit.assert_awaited_once()
 
@@ -1355,7 +1355,7 @@ async def test_schedule_job_raises_when_job_not_found_unit() -> None:
     with pytest.raises(ValueError, match="Job not found"):
         await scheduler.schedule_job(job, worker)
 
-    session.get.assert_awaited_once_with(Job, job.id, with_for_update=True)
+    session.get.assert_awaited_once_with(Job, job.id, with_for_update=True, populate_existing=True)
     session.commit.assert_not_awaited()
 
 
