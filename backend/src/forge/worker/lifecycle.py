@@ -24,6 +24,11 @@ class WorkerExecutionLifecycle:
             status=AttemptStatus.STARTING,
         )
 
+        await self.status_reporter.report(
+            attempt_id=attempt_id,
+            status=AttemptStatus.RUNNING,
+        )
+
         result = await self.executor.execute(request)
 
         if result.exit_code == 0:

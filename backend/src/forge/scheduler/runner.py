@@ -15,6 +15,8 @@ class SchedulerRunner:
         self._stop_event = asyncio.Event()
 
     async def run_once(self) -> None:
+        await self.processor.scheduler.reap_expired_workers()
+
         pending_events = await self.consumer.consume_pending()
 
         for message_id, data in pending_events:
@@ -22,6 +24,15 @@ class SchedulerRunner:
             await self.consumer.acknowledge(message_id)
 
         if pending_events:
+            return
+
+        stale_pending_events = await self.consumer.consume_stale_pending()
+
+        for message_id, data in stale_pending_events:
+            await self.processor.process(message_id, data)
+            await self.consumer.acknowledge(message_id)
+
+        if stale_pending_events:
             return
 
         events = await self.consumer.consume()

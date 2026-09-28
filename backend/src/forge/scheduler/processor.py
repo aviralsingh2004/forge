@@ -13,15 +13,27 @@ class SchedulerEventProcessor:
         data: dict[str, str],
     ) -> None:
         event_type = data.get("event_type")
-        job_id = data.get("job_id")
+        job_id_str = data.get("job_id")
 
         if event_type != "JOB_CREATED":
             return
 
-        if job_id is None:
+        if job_id_str is None:
             raise ValueError("JOB_CREATED event is missing job_id")
 
-        assignment = await self.scheduler.schedule_next_job()
+        job_id = UUID(job_id_str)
+
+        # Phase 9 R3: idempotency — look up the specific job referenced by this event.
+        # schedule_event_job() returns:
+        #   Assignment  — job was QUEUED; scheduling completed normally.
+        #   None        — job is no longer QUEUED (already handled); safe to ACK.
+        # Raises ValueError if the job does not exist.
+        # Raises RuntimeError if the job is QUEUED but no eligible worker exists.
+        assignment = await self.scheduler.schedule_event_job(job_id)
 
         if assignment is None:
-            raise RuntimeError(f"Unable to schedule JOB_CREATED event for job {UUID(job_id)}")
+            # Job was already scheduled (or otherwise left the QUEUED state).
+            # Treat the event as obsolete — the runner will ACK it safely.
+            return
+
+        # Scheduling completed: assignment created, caller will ACK.

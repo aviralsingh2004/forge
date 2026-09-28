@@ -1,4 +1,7 @@
-from sqlalchemy import select
+from datetime import UTC, datetime, timedelta
+from uuid import UUID
+
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -18,8 +21,13 @@ from forge.db.models import (
 
 
 class Scheduler:
-    def __init__(self, session: AsyncSession) -> None:
+    def __init__(
+        self,
+        session: AsyncSession,
+        heartbeat_timeout_seconds: int = 30,
+    ) -> None:
         self.session = session
+        self.heartbeat_timeout_seconds = heartbeat_timeout_seconds
 
     async def get_next_job(self) -> Job | None:
         result = await self.session.execute(
@@ -243,3 +251,88 @@ class Scheduler:
             return None
 
         return await self.schedule_job(job, worker)
+
+    async def schedule_event_job(self, job_id: UUID) -> Assignment | None:
+        """Schedule the specific job referenced by a Redis scheduling event.
+
+        Returns:
+            Assignment   — job was QUEUED and a worker was found; scheduling completed.
+            None         — job is no longer QUEUED (already handled); caller may ACK
+                           the event safely.
+
+        Raises:
+            ValueError   — job_id does not exist in the database.
+            RuntimeError — job is QUEUED but no eligible worker could be found.
+        """
+        result = await self.session.execute(select(Job).where(Job.id == job_id))
+        job = result.scalar_one_or_none()
+
+        if job is None:
+            raise ValueError(f"Job {job_id} not found")
+
+        if job.status != JobStatus.QUEUED:
+            # Event is obsolete — job was already scheduled (or cancelled/failed).
+            # Return None so the caller can ACK the Redis message safely.
+            return None
+
+        workers = await self.get_ready_workers()
+        eligible_workers = self.filter_workers(job, workers)
+        worker = self.select_worker(job, eligible_workers)
+
+        if worker is None:
+            return None
+
+        return await self.schedule_job(job, worker)
+
+    async def reap_expired_workers(
+        self,
+        now: datetime | None = None,
+        timeout_seconds: int | None = None,
+    ) -> list[Worker]:
+        """Detect workers whose heartbeat has expired, mark them OFFLINE, and release their ACTIVE reservations.
+
+        Returns:
+            list[Worker] — list of expired Worker instances that were reaped.
+        """
+        current_time = now if now is not None else datetime.now(UTC)
+        timeout = (
+            timeout_seconds
+            if timeout_seconds is not None
+            else self.heartbeat_timeout_seconds
+        )
+        cutoff = current_time - timedelta(seconds=timeout)
+
+        result = await self.session.execute(
+            select(Worker)
+            .where(
+                Worker.status != WorkerStatus.OFFLINE,
+                func.coalesce(Worker.last_heartbeat_at, Worker.created_at) < cutoff,
+            )
+            .with_for_update()
+        )
+        expired_workers = list(result.scalars().all())
+
+        if not expired_workers:
+            return []
+
+        for worker in expired_workers:
+            worker.status = WorkerStatus.OFFLINE
+
+            res_result = await self.session.execute(
+                select(Reservation).where(
+                    Reservation.worker_id == worker.id,
+                    Reservation.status == ReservationStatus.ACTIVE,
+                )
+            )
+            active_reservations = list(res_result.scalars().all())
+            for reservation in active_reservations:
+                reservation.status = ReservationStatus.RELEASED
+                reservation.released_at = current_time
+
+        try:
+            await self.session.commit()
+        except Exception:
+            await self.session.rollback()
+            raise
+
+        return expired_workers

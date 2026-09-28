@@ -6,12 +6,13 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from forge.api.schemas.workers import AttemptStatusRequest, AttemptStatusResponse
-from forge.db.models import Attempt, AttemptStatus
+from forge.db.models import Attempt, AttemptStatus, Reservation, ReservationStatus
 from forge.db.session import get_session
 
 router = APIRouter(prefix="/api/v1/attempts", tags=["attempts"])
 
 ALLOWED_ATTEMPT_TRANSITIONS = {
+    AttemptStatus.CREATED: {AttemptStatus.STARTING, AttemptStatus.ASSIGNED},
     AttemptStatus.ASSIGNED: {AttemptStatus.STARTING},
     AttemptStatus.STARTING: {AttemptStatus.RUNNING},
     AttemptStatus.RUNNING: {
@@ -19,6 +20,12 @@ ALLOWED_ATTEMPT_TRANSITIONS = {
         AttemptStatus.FAILED,
         AttemptStatus.CANCELLED,
     },
+}
+
+TERMINAL_ATTEMPT_STATUSES = {
+    AttemptStatus.SUCCEEDED,
+    AttemptStatus.FAILED,
+    AttemptStatus.CANCELLED,
 }
 
 
@@ -51,11 +58,7 @@ async def update_attempt_status(
         if attempt.started_at is None:
             attempt.started_at = datetime.now(UTC)
 
-    elif status_data.status in {
-        AttemptStatus.SUCCEEDED,
-        AttemptStatus.FAILED,
-        AttemptStatus.CANCELLED,
-    }:
+    elif status_data.status in TERMINAL_ATTEMPT_STATUSES:
         attempt.finished_at = datetime.now(UTC)
 
     if status_data.exit_code is not None:
@@ -63,6 +66,19 @@ async def update_attempt_status(
 
     if status_data.error_message is not None:
         attempt.error_message = status_data.error_message
+
+    # Phase 9 R1: Release active Reservation atomically with terminal Attempt transition.
+    if status_data.status in TERMINAL_ATTEMPT_STATUSES:
+        res_result = await session.execute(
+            select(Reservation).where(
+                Reservation.attempt_id == attempt_id,
+                Reservation.status == ReservationStatus.ACTIVE,
+            )
+        )
+        reservation = res_result.scalar_one_or_none()
+        if reservation is not None:
+            reservation.status = ReservationStatus.RELEASED
+            reservation.released_at = datetime.now(UTC)
 
     try:
         await session.commit()
